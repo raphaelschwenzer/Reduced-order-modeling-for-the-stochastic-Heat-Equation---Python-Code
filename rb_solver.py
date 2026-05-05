@@ -1,30 +1,19 @@
 # Imports
 import numpy as np
-import math
-import matplotlib.pyplot as plt
 import ufl
-
-from scipy.sparse import csr_matrix
 from time import perf_counter
-from mpi4py import MPI
-from petsc4py import PETSc
-from dolfinx import mesh, fem
-from dolfinx.fem.petsc import assemble_matrix, assemble_vector
 from itertools import product
-from scipy.linalg import solve
-from dolfinx.fem.petsc import apply_lifting, set_bc
 
 # Local modules
-from discretize import discretize
-from model import model, petsc_mat_to_csr
 from pod import pod
 from noise import build_noise_modes
 from evaluate_error import evaluate_error
 
-def rb_solver(sigma_factor, sigma_func, L, k_max, fom, N, e_funcs, nu, N_realizations=10, mode='Sampling', direct_on_noise=False, name='None'):
+
+def rb_solver(sigma_factor, sigma_func, L, k_max, fom, N, e_funcs, sqrt_lambda, tau_rel=1e-8, N_realizations=100, mode='Sampling', direct_on_noise=False, name='None'):
     print(mode)
     sigma_factor = float(sigma_factor)
-    # Domain and space-time dimensions
+
     domain = fom.pde["domain"]
     m = fom.pde["m"]
     n = fom.pde["n"]
@@ -42,146 +31,137 @@ def rb_solver(sigma_factor, sigma_func, L, k_max, fom, N, e_funcs, nu, N_realiza
 
     # Data storage
     POD_VALUES = []
-    MU_REFS = np.zeros((k_max, N, n-1))
+    B_REFS = np.zeros((k_max, N, n-1))
     basis_lengths = []
 
     ########################################################################
-    # We implement Algorithm 1 and need the number L << M of sampling points
-    # 1. of Algorithm 1: Solve the FOM with no noise
+    # We implement the RB algorithm for the greeedy and the sampling case
+    # Solve the FOM with no noise
     if direct_on_noise:
-        mu_0 = np.random.randn(N, n-1)
+        B_0 = np.random.randn(N, n-1)
     else:
-        mu_0 = np.zeros((N, n-1))
+        B_0 = np.zeros((N, n-1))
 
-    MU_REFS[0] = mu_0
+    B_REFS[0] = B_0
     start_time = perf_counter()
-    Y_0 = fom.solve(mu_0, nu, PhiDelta, PhiGrad, N)
+    Y_0 = fom.solve(B_0, sqrt_lambda, PhiDelta, PhiGrad, N)
     end_time = perf_counter()
     print('Zeit für das Lösen des FOM: '+str(end_time - start_time)+' seconds')
 
-    # 2. of Algorithm 1: Generate the POD-Basis with maximal size l_0
+    # Generate the POD-Basis with maximal size l_0
     POD = pod(W, D)
-    Psi_0, POD_values, _ = POD.get_pod_basis(Y_0)
+    Psi_0, POD_values, _ = POD.get_pod_basis(Y_0, rel_tol=tau_rel)
     POD_VALUES.append(POD_values)
+    global_tol = tau_rel * POD_values[0]
+    tol_error = global_tol**2 * dt * n
 
-    # 3. of Algorithm 1: Set initial parameters
+    # Set initial parameters
     k = 0
     Psi = Psi_0
     basis_lengths.append(Psi.shape[1])
     rom = POD.galerkinprojection(fom, Psi_0)
-    Y_tilde_error = []
-
-    # 4.-8. of Algorithm 1: Set stopping criterium
-    if mode == 'Cohen':
-        mus_training = np.sqrt(dt) * np.random.randn(L, N, n-1)
 
     if mode == 'POD-greedy':
         # Generate tensor product of stochastic process
-        mus_training = []
+        Bs_training = []
         
-        mu_factor = 33
-        M_grid = [-dt, 0, dt]
-        for counter, mu_M_array in enumerate(product(M_grid, repeat=N * int((n - 1) / mu_factor))):
-            mu_M_single = np.array(mu_M_array).reshape(N, int((n - 1) / mu_factor))
-            mu_M = np.repeat(mu_M_single, mu_factor, axis=1)
-            mus_training.append(mu_M)
+        B_factor = 33
+        B_grid = [-dt, 0, dt]
+        for counter, B_array in enumerate(product(B_grid, repeat=N * int((n-1) / B_factor))):
+            B_single = np.array(B_array).reshape(N, int((n - 1) / B_factor))
+            Bs_training.append(np.repeat(B_single, B_factor, axis=1))
 
-        L = len(mus_training)
+        L = len(Bs_training)
         print(f"Dimension of training set: {L}")
     
-    mus_realization = np.sqrt(dt) * np.random.randn(N_realizations, N, n-1)
+    Bs_realization = np.sqrt(dt) * np.random.randn(N_realizations, N, n-1)
+
+    error_real = np.zeros((len(Bs_realization), n))
+    error_estimates = np.zeros((len(Bs_realization), n-1))
 
     # Calculate error from first iteration
-    error_real = np.zeros((len(mus_realization), n))
-    error_estimates = np.zeros((len(mus_realization), n - 1))
+    for iB, B in enumerate(Bs_realization):
+        error_real[iB], error_estimates[iB], _ = evaluate_error(fom, rom, Psi, B, sqrt_lambda, PhiDelta, PhiGrad, N, compute_real_error=True)
+        np.save(f'Data/error_real_sigma_{sigma_factor}_k_{k}_L_{L}_'+name, error_real)
+        np.save(f'Data/error_estimates_sigma_{sigma_factor}_k_{k}_L_{L}_'+name, error_estimates)
 
-    for imu, mu in enumerate(mus_realization):
-        error_real[imu], error_estimates[imu], _ = evaluate_error(fom, rom, Psi, mu, nu, PhiDelta, PhiGrad, N, compute_real_error=True)
-        np.save(f'Data/error_real_sigma_{sigma_factor}_k_{k}_'+name, error_real)
-        np.save(f'Data/error_estimates_sigma_{sigma_factor}_k_{k}_'+name, error_estimates)
 
-    L20TH_errors = np.zeros((1, k_max))
-
-    error = 1
+    k = 1
     print('################## Start with while loop -- Sampling ##################')
-    while k < k_max: #and error > 1e-15: 
-        # 5. of Algorithm 1: Draw L independent parameter vectors
+    while k < k_max:
+        # Draw L independent parameter vectors
         if mode == 'Sampling':
-            mu_k = np.sqrt(dt) * np.random.randn(L, N, n-1)
+            B_k = np.sqrt(dt) * np.random.randn(L, N, n-1)
         else:
-            mu_k = mus_training
+            B_k = Bs_training
 
-        # and compute the argmax
+        # Compute argmax of error estimator over training set
         error_ref = 0
-        mu_ref = np.zeros((N, n-1))
+        B_ref = np.zeros((N, n-1))
         Y_l_ref = np.zeros((m, n))
+        error_histogram = np.zeros(L)
 
         for iL in range(L):
-            # Compute the solution for the parameter mu_k[iL]
-            mu = mu_k[iL]
-            _, error_estimates, Y_l = evaluate_error(fom, rom, Psi, mu, nu, PhiDelta, PhiGrad, N, compute_real_error=False, k=k)
-            error = np.sum(error_estimates)
-
-            S_norm = np.sum(mu**2) / (dt * N * (n - 1))
-            p = 5
-            mu_weight = np.exp(-p * (S_norm - 1))
-            #print(S_norm, mu_weight)
-            error *= mu_weight
-
+            B = B_k[iL]
+            _, error_estimates_B, Y_l = evaluate_error(fom, rom, Psi, B, sqrt_lambda, PhiDelta, PhiGrad, N, compute_real_error=False, k=k)
+            error = np.sum(error_estimates_B)
+            error_histogram[iL] = error
             if error > error_ref:
                 error_ref = error
-                mu_ref = mu
+                B_ref = B
                 Y_l_ref = Y_l
 
-        # and set Y_tilde as the difference between FOM and ROM solution 
-        Y_k = fom.solve(mu_ref, nu, PhiDelta, PhiGrad, N)
+        print(error_ref, tol_error)
+
+        # Check error stopping criterion
+        if error_ref < tol_error:
+            print(f"Stopped: max error estimator {error_ref:.2e} < tol_error {tol_error:.2e}")
+            break
+
+        # Solve FOM for worst-case parameter and compute residual snapshot and compute new POD basis from residual snapshot
+        Y_k = fom.solve(B_ref, sqrt_lambda, PhiDelta, PhiGrad, N)
         Y_tilde = Y_k - Y_l_ref
-        Y_tilde_error.append(np.sum(np.abs(Y_tilde)))
-
-        # 6. of Algorithm 1: Compute the new POD basis
-        Psi_k, POD_values, _ = POD.get_pod_basis(Y_tilde)
-
+        Psi_k, POD_values, _ = POD.get_pod_basis(Y_tilde, abs_tol=global_tol)
         POD_VALUES.append(POD_values)
 
-        # Orthogonalize
-        if Psi_k.shape[1] != 0:
-            Psi_combined = np.hstack((Psi, Psi_k))
-            U, S, _ = np.linalg.svd(Psi_combined, full_matrices=False)
-            rank = np.sum(S > 1e-10 * S[0])
-            Psi = U[:, :rank]
+        # Check if any new basis vectors were found
+        if Psi_k.shape[1] == 0:
+            print("Stopped: no new basis vectors above global_tol")
+            break
+
+        # Orthogonalize extended basis via SVD
+        Psi_combined = np.hstack((Psi, Psi_k))
+        U, S, _ = np.linalg.svd(Psi_combined, full_matrices=False)
+        rank = np.sum(S > 1e-10 * S[0])
+        Psi = U[:, :rank]
 
         basis_lengths.append(Psi.shape[1])
         print(f"Psi shape: {Psi.shape}")
+
+        # Check if basis rank actually grew
+        if basis_lengths[-1] == basis_lengths[-2]:
+            print("Stopped: basis rank stagnated after orthogonalization")
+            break
+
+        # Update ROM and reference
         rom = POD.galerkinprojection(fom, Psi)
-        MU_REFS[k] = mu_ref
+        B_REFS[k] = B_ref
 
-        if mode == 'Cohen':
-            for imu, mu in enumerate(mu_cohen_realizations):
-                # Solve FOM
-                Y = fom.solve(mu, nu, PhiDelta, PhiGrad, N)
+        # Evaluate and save errors on realization set
+        error_real = np.zeros((len(Bs_realization), n))
+        error_estimates = np.zeros((len(Bs_realization), n - 1))
+        for iB, B in enumerate(Bs_realization):
+            error_real[iB], error_estimates[iB], _ = evaluate_error(fom, rom, Psi, B, sqrt_lambda, PhiDelta, PhiGrad, N, compute_real_error=True)
 
-                # Solve ROM
-                PhiDeltal, PhiGradl = rom.generatePhis(PhiDelta, PhiGrad, Psi, N)
-                Y_l = rom.solve(mu, nu, PhiDeltal, PhiGradl, N)
-                PsiY_l = Psi @ Y_l
-
-                L20TH_errors[imu][k-1] = fom.L20TH_norm(Y - PsiY_l)
-
-        # Analysis of POD basis and its errors
-        error_real = np.zeros((len(mus_realization), n))
-        error_estimates = np.zeros((len(mus_realization), n - 1))
-
-        for imu, mu in enumerate(mus_realization):
-            error_real[imu], error_estimates[imu], _ = evaluate_error(fom, rom, Psi, mu, nu, PhiDelta, PhiGrad, N, compute_real_error=True)
-
-        np.save(f'Data/error_real_sigma_{sigma_factor}_k_{k+1}_'+name, error_real)
-        np.save(f'Data/error_estimates_sigma_{sigma_factor}_k_{k+1}_'+name, error_estimates)
+        np.save(f'Data/error_real_sigma_{sigma_factor}_k_{k}_L_{L}_' + name, error_real)
+        np.save(f'Data/error_estimates_sigma_{sigma_factor}_k_{k}_L_{L}_' + name, error_estimates)
+        np.save(f'Data/error_histogram_sigma_{sigma_factor}_k_{k}_L_{L}_'+name, error_histogram)
 
         k += 1
 
-    np.save(f'Data/MU_REFS_sigma_{sigma_factor}'+name, MU_REFS)
-    np.save(f'Data/basis_lengths_{sigma_factor}'+name, np.array(basis_lengths))    
+    np.save(f'Data/B_REFS_sigma_{sigma_factor}_L_{L}_'+name, B_REFS)
+    np.save(f'Data/basis_lengths_sigma_{sigma_factor}_L_{L}_'+name, np.array(basis_lengths))
 
-    noise = {"Psi": Psi, "PhiDelta": PhiDelta, "PhiGrad": PhiGrad, "N": N, "nu": nu}
+    noise = {"Psi": Psi, "PhiDelta": PhiDelta, "PhiGrad": PhiGrad, "N": N, "sqrt_lambda": sqrt_lambda}
 
-    return rom, noise, POD_VALUES, MU_REFS, L20TH_errors
+    return rom, noise, POD_VALUES, B_REFS, k
